@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent
@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Target classes to anonymize (defaults to person, car, truck, bus, motorcycle, motorbike)",
+    )
+    parser.add_argument(
+        "--manual-roi",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Manual ROI boxes defined as x1,y1,x2,y2 in the first frame; can provide multiple.",
     )
     return parser.parse_args()
 
@@ -108,6 +115,21 @@ def main() -> None:
     if target_classes:
         print(f"仅处理类别: {', '.join(target_classes)}")
 
+    manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None
+    if args.manual_roi:
+        parsed: List[Tuple[int, int, int, int]] = []
+        for spec in args.manual_roi:
+            parts = spec.split(",")
+            if len(parts) != 4:
+                raise ValueError(f"无效的 ROI 格式: {spec}，请使用 x1,y1,x2,y2")
+            try:
+                x1, y1, x2, y2 = (int(p) for p in parts)
+            except ValueError as exc:
+                raise ValueError(f"ROI 坐标必须为整数: {spec}") from exc
+            parsed.append((x1, y1, x2, y2))
+        manual_rois = parsed
+        print(f"手动跟踪 ROI 个数: {len(parsed)}")
+
     digest = run_pipeline(
         str(input_path),
         str(output_path),
@@ -116,6 +138,7 @@ def main() -> None:
         str(data_pack_path),
         hmac_key,
         target_classes=target_classes,
+        manual_rois=manual_rois,
     )
 
     print(f"匿名化完成 -> 输出视频: {output_path}")

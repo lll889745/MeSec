@@ -21,6 +21,14 @@ FrameItem = Tuple[int, np.ndarray]
 ProcessedItem = Tuple[int, np.ndarray, List[Dict[str, object]]]
 
 
+def _create_tracker() -> cv2.Tracker:
+    if hasattr(cv2, "TrackerCSRT_create"):
+        return cv2.TrackerCSRT_create()
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+        return cv2.legacy.TrackerCSRT_create()
+    raise RuntimeError("当前 OpenCV 安装不支持 CSRT 跟踪器，请安装 opencv-contrib-python >= 4.5")
+
+
 def producer(video_path: str, frame_queue: Queue, sentinel: Optional[object] = None, worker_count: int = 1) -> None:
     """Read frames from a video file and enqueue them for processing."""
     cap = cv2.VideoCapture(video_path)
@@ -72,9 +80,12 @@ def worker(
     encryption_key: bytes,
     sentinel: Optional[object] = None,
     target_classes: Optional[Sequence[str]] = None,
+    manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
 ) -> None:
     """Consume raw frames, run detection/anonymization, and enqueue results."""
     sensitive_classes = set(target_classes or ("person", "car", "truck", "bus", "motorcycle", "motorbike"))
+    tracker_entries: List[Dict[str, object]] = []
+    trackers_initialized = False
 
     while True:
         item = frame_queue.get()
@@ -90,11 +101,60 @@ def worker(
             processed_frame = frame.copy()
             height, width = processed_frame.shape[:2]
 
+            if manual_rois and not trackers_initialized:
+                for idx, bbox in enumerate(manual_rois):
+                    x1, y1, x2, y2 = map(int, bbox)
+                    x1 = max(0, min(x1, width - 1))
+                    y1 = max(0, min(y1, height - 1))
+                    x2 = max(0, min(x2, width))
+                    y2 = max(0, min(y2, height))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    tracker = _create_tracker()
+                    tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
+                    tracker_entries.append({
+                        "tracker": tracker,
+                        "id": f"manual_{idx}",
+                    })
+                trackers_initialized = True
+
             try:
                 results = model(processed_frame, verbose=False)
             except TypeError:
                 results = model(processed_frame)
             metadata: List[Dict[str, object]] = []
+
+            manual_metadata: List[Dict[str, object]] = []
+            active_trackers: List[Dict[str, object]] = []
+            for entry in tracker_entries:
+                tracker = entry["tracker"]
+                ok, bbox = tracker.update(frame)
+                if not ok:
+                    continue
+                x, y, w, h = bbox
+                x1 = max(0, min(int(round(x)), width - 1))
+                y1 = max(0, min(int(round(y)), height - 1))
+                x2 = max(0, min(int(round(x + w)), width))
+                y2 = max(0, min(int(round(y + h)), height))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                roi = frame[y1:y2, x1:x2]
+                encrypted_blob = encrypt_roi(roi, encryption_key)
+                anonymize_region(processed_frame, (x1, y1, x2, y2))
+
+                manual_metadata.append(
+                    {
+                        "label": entry.get("id", "manual"),
+                        "confidence": 1.0,
+                        "bbox": (x1, y1, x2, y2),
+                        "encrypted": encrypted_blob,
+                        "source": "manual",
+                    }
+                )
+                active_trackers.append(entry)
+
+            tracker_entries = active_trackers
 
             # YOLOv8 returns a list; iterate over detections in the first result.
             for result in results:
@@ -137,6 +197,9 @@ def worker(
                             "encrypted": encrypted_blob,
                         }
                     )
+
+            if manual_metadata:
+                metadata.extend(manual_metadata)
 
             processed_queue.put((frame_index, processed_frame, metadata))
         finally:
@@ -184,6 +247,7 @@ def run_pipeline(
     data_pack_path: str,
     hmac_key: bytes,
     target_classes: Optional[Sequence[str]] = None,
+    manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
 ) -> bytes:
     frame_queue: Queue = Queue(maxsize=32)
     processed_queue: Queue = Queue(maxsize=32)
@@ -213,7 +277,7 @@ def run_pipeline(
     )
     worker_thread = threading.Thread(
         target=worker,
-        args=(frame_queue, processed_queue, model, encryption_key, sentinel, target_classes),
+        args=(frame_queue, processed_queue, model, encryption_key, sentinel, target_classes, manual_rois),
         daemon=True,
     )
     consumer_thread = threading.Thread(
