@@ -2,13 +2,41 @@
   <aside class="status-banner">
     <h2>系统状态</h2>
     <p>{{ status }}</p>
+    <div v-if="progressValue !== null" class="progress">
+      <div class="progress__bar">
+        <div class="progress__fill" :style="{ width: `${progressValue}%` }" />
+      </div>
+      <span>{{ progressLabel }}%</span>
+    </div>
   </aside>
 </template>
 
 <script setup lang="ts">
-defineProps<{
+import { computed, toRefs } from 'vue';
+
+const rawProps = defineProps<{
   status: string;
+  progress?: number | null;
 }>();
+
+const { status, progress } = toRefs(rawProps);
+
+const progressValue = computed(() => {
+  const value = progress.value;
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return Math.min(100, Math.max(0, value));
+});
+
+const progressLabel = computed(() => {
+  if (progressValue.value === null) {
+    return '';
+  }
+  const value = progressValue.value;
+  const precision = value < 10 ? 1 : 0;
+  return value.toFixed(precision);
+});
 </script>
 
 <style scoped>
@@ -22,5 +50,32 @@ defineProps<{
 .status-banner h2 {
   margin-bottom: 0.75rem;
   font-size: 1.25rem;
+}
+
+.progress {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.progress__bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.progress__fill {
+  height: 100%;
+  background: linear-gradient(90deg, #42b883, #36a173);
+  transition: width 0.2s ease;
+}
+
+.progress span {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.9);
 }
 </style>

@@ -3,7 +3,7 @@ import sys
 import threading
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent
@@ -73,6 +73,15 @@ def anonymize_region(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None
     frame[y1:y2, x1:x2] = blurred
 
 
+def _safe_callback(callback: Optional[Callable[[str, Dict[str, Any]], None]], event: str, data: Dict[str, Any]) -> None:
+    if not callback:
+        return
+    try:
+        callback(event, data)
+    except Exception as error:  # pragma: no cover - defensive logging
+        print(f"[status_callback_error] {event}: {error}", file=sys.stderr)
+
+
 def worker(
     frame_queue: Queue,
     processed_queue: Queue,
@@ -81,6 +90,7 @@ def worker(
     sentinel: Optional[object] = None,
     target_classes: Optional[Sequence[str]] = None,
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
     """Consume raw frames, run detection/anonymization, and enqueue results."""
     sensitive_classes = set(target_classes or ("person", "car", "truck", "bus", "motorcycle", "motorbike"))
@@ -112,10 +122,12 @@ def worker(
                         continue
                     tracker = _create_tracker()
                     tracker.init(frame, (x1, y1, x2 - x1, y2 - y1))
-                    tracker_entries.append({
-                        "tracker": tracker,
-                        "id": f"manual_{idx}",
-                    })
+                    tracker_entries.append(
+                        {
+                            "tracker": tracker,
+                            "id": f"manual_{idx}",
+                        }
+                    )
                 trackers_initialized = True
 
             try:
@@ -143,14 +155,22 @@ def worker(
                 encrypted_blob = encrypt_roi(roi, encryption_key)
                 anonymize_region(processed_frame, (x1, y1, x2, y2))
 
-                manual_metadata.append(
+                block = {
+                    "label": entry.get("id", "manual"),
+                    "confidence": 1.0,
+                    "bbox": (x1, y1, x2, y2),
+                    "encrypted": encrypted_blob,
+                    "source": "manual",
+                }
+                manual_metadata.append(block)
+                _safe_callback(
+                    status_callback,
+                    "manual_roi",
                     {
-                        "label": entry.get("id", "manual"),
-                        "confidence": 1.0,
+                        "frame_index": frame_index,
                         "bbox": (x1, y1, x2, y2),
-                        "encrypted": encrypted_blob,
-                        "source": "manual",
-                    }
+                        "tracker_id": entry.get("id", "manual"),
+                    },
                 )
                 active_trackers.append(entry)
 
@@ -189,13 +209,23 @@ def worker(
                     encrypted_blob = encrypt_roi(roi, encryption_key)
                     anonymize_region(processed_frame, (x1, y1, x2, y2))
 
-                    metadata.append(
+                    block = {
+                        "label": label,
+                        "confidence": conf,
+                        "bbox": (x1, y1, x2, y2),
+                        "encrypted": encrypted_blob,
+                        "source": "detection",
+                    }
+                    metadata.append(block)
+                    _safe_callback(
+                        status_callback,
+                        "detection",
                         {
+                            "frame_index": frame_index,
                             "label": label,
                             "confidence": conf,
                             "bbox": (x1, y1, x2, y2),
-                            "encrypted": encrypted_blob,
-                        }
+                        },
                     )
 
             if manual_metadata:
@@ -216,12 +246,16 @@ def consumer(
     frame_size: tuple[int, int],
     data_pack_writer: Optional[DataPackWriter] = None,
     sentinel: Optional[object] = None,
+    status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    total_frames: int = 0,
 ) -> None:
     """Write processed frames to an output video file until sentinel is received."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
     if not writer.isOpened():
         raise RuntimeError(f"无法创建输出视频: {output_path}")
+
+    processed_count = 0
 
     try:
         while True:
@@ -233,6 +267,16 @@ def consumer(
                 if data_pack_writer is not None and metadata:
                     data_pack_writer.write_frame_data(frame_index, metadata)
                 writer.write(processed_frame)
+                processed_count += 1
+                _safe_callback(
+                    status_callback,
+                    "progress",
+                    {
+                        "frame_index": frame_index,
+                        "processed": processed_count,
+                        "total_frames": total_frames,
+                    },
+                )
             finally:
                 processed_queue.task_done()
     finally:
@@ -248,6 +292,7 @@ def run_pipeline(
     hmac_key: bytes,
     target_classes: Optional[Sequence[str]] = None,
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> bytes:
     frame_queue: Queue = Queue(maxsize=32)
     processed_queue: Queue = Queue(maxsize=32)
@@ -261,7 +306,19 @@ def run_pipeline(
     fps = tmp_cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(tmp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(tmp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(tmp_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     tmp_cap.release()
+
+    _safe_callback(
+        status_callback,
+        "metadata",
+        {
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "total_frames": total_frames,
+        },
+    )
 
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -277,12 +334,30 @@ def run_pipeline(
     )
     worker_thread = threading.Thread(
         target=worker,
-        args=(frame_queue, processed_queue, model, encryption_key, sentinel, target_classes, manual_rois),
+        args=(
+            frame_queue,
+            processed_queue,
+            model,
+            encryption_key,
+            sentinel,
+            target_classes,
+            manual_rois,
+            status_callback,
+        ),
         daemon=True,
     )
     consumer_thread = threading.Thread(
         target=consumer,
-    args=(processed_queue, str(output_path_obj), fps, (width, height), data_pack_writer, sentinel),
+        args=(
+            processed_queue,
+            str(output_path_obj),
+            fps,
+            (width, height),
+            data_pack_writer,
+            sentinel,
+            status_callback,
+            total_frames,
+        ),
         daemon=True,
     )
 
@@ -296,10 +371,15 @@ def run_pipeline(
     worker_thread.join()
     consumer_thread.join()
 
+    _safe_callback(status_callback, "finalizing", {})
+
     try:
         digest = data_pack_writer.finalize(hmac_key)
     finally:
         data_pack_writer.close()
+
+    _safe_callback(status_callback, "finalized", {"digest": digest.hex()})
+
     return digest
 
 

@@ -1,8 +1,9 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 CURRENT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = CURRENT_DIR.parent
@@ -58,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Manual ROI boxes defined as x1,y1,x2,y2 in the first frame; can provide multiple.",
     )
+    parser.add_argument(
+        "--json-progress",
+        action="store_true",
+        help="Emit progress events as JSON lines for external integration.",
+    )
     return parser.parse_args()
 
 
@@ -67,7 +73,7 @@ def resolve_device(device: str) -> str:
     return device
 
 
-def ensure_key(hex_key: Optional[str], label: str, default_len: int = 32) -> bytes:
+def ensure_key(hex_key: Optional[str], label: str, default_len: int = 32, logger: Optional[Callable[[str], None]] = None) -> bytes:
     if hex_key:
         try:
             key_bytes = bytes.fromhex(hex_key)
@@ -77,11 +83,12 @@ def ensure_key(hex_key: Optional[str], label: str, default_len: int = 32) -> byt
             raise ValueError(f"{label} 必须为 16/24/32 字节长度")
         return key_bytes
     key = os.urandom(default_len)
-    print(f"生成 {label} (hex): {key.hex()}")
+    if logger:
+        logger(f"生成 {label} (hex): {key.hex()}")
     return key
 
 
-def ensure_hmac_key(hex_key: Optional[str], fallback: bytes) -> bytes:
+def ensure_hmac_key(hex_key: Optional[str], fallback: bytes, logger: Optional[Callable[[str], None]] = None) -> bytes:
     if hex_key:
         try:
             key_bytes = bytes.fromhex(hex_key)
@@ -90,7 +97,8 @@ def ensure_hmac_key(hex_key: Optional[str], fallback: bytes) -> bytes:
         if not key_bytes:
             raise ValueError("HMAC 密钥不能为空")
         return key_bytes
-    print("未提供 HMAC 密钥，默认与 AES 密钥相同。")
+    if logger:
+        logger("未提供 HMAC 密钥，默认与 AES 密钥相同。")
     return fallback
 
 
@@ -103,17 +111,31 @@ def main() -> None:
     output_path = args.output or input_path.with_name(f"{input_path.stem}_anonymized.mp4")
     data_pack_path = args.data_pack or output_path.with_name(output_path.stem + "_encrypted_data.pack")
 
+    json_mode = bool(args.json_progress)
+
+    def emit_event(event: str, data: Optional[Dict[str, object]] = None) -> None:
+        payload = {"event": event}
+        if data:
+            payload.update(data)
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def log(message: str) -> None:
+        if json_mode:
+            emit_event("log", {"message": message})
+        else:
+            print(message)
+
     device = resolve_device(args.device)
-    print(f"加载模型 {args.model} 到 {device} 设备")
+    log(f"加载模型 {args.model} 到 {device} 设备")
     model = YOLO(str(args.model))
     model.to(device)
 
-    encryption_key = ensure_key(args.key, "AES 密钥")
-    hmac_key = ensure_hmac_key(args.hmac_key, encryption_key)
+    encryption_key = ensure_key(args.key, "AES 密钥", logger=log)
+    hmac_key = ensure_hmac_key(args.hmac_key, encryption_key, logger=log)
 
     target_classes: Optional[Sequence[str]] = args.classes
     if target_classes:
-        print(f"仅处理类别: {', '.join(target_classes)}")
+        log(f"仅处理类别: {', '.join(target_classes)}")
 
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None
     if args.manual_roi:
@@ -128,24 +150,53 @@ def main() -> None:
                 raise ValueError(f"ROI 坐标必须为整数: {spec}") from exc
             parsed.append((x1, y1, x2, y2))
         manual_rois = parsed
-        print(f"手动跟踪 ROI 个数: {len(parsed)}")
+        log(f"手动跟踪 ROI 个数: {len(parsed)}")
 
-    digest = run_pipeline(
-        str(input_path),
-        str(output_path),
-        model,
-        encryption_key,
-        str(data_pack_path),
-        hmac_key,
-        target_classes=target_classes,
-        manual_rois=manual_rois,
-    )
+    def status_callback(event: str, data: Dict[str, object]) -> None:
+        if json_mode:
+            emit_event(event, data)
+        elif event == "progress":
+            processed = data.get("processed", 0)
+            total = data.get("total_frames", 0) or 0
+            percent = 0.0
+            if total:
+                percent = float(processed) / float(total) * 100.0
+            print(f"进度: {processed}/{total or '?'} ({percent:.2f}%)")
 
-    print(f"匿名化完成 -> 输出视频: {output_path}")
-    print(f"加密数据包: {data_pack_path}")
-    print(f"数据包 HMAC: {digest.hex()}")
-    print(f"AES 密钥 (hex): {encryption_key.hex()}")
-    print(f"HMAC 密钥 (hex): {hmac_key.hex()}")
+    try:
+        digest = run_pipeline(
+            str(input_path),
+            str(output_path),
+            model,
+            encryption_key,
+            str(data_pack_path),
+            hmac_key,
+            target_classes=target_classes,
+            manual_rois=manual_rois,
+            status_callback=status_callback,
+        )
+    except Exception as exc:  # pragma: no cover - integration error path
+        if json_mode:
+            emit_event("error", {"message": str(exc)})
+        raise
+
+    if json_mode:
+        emit_event(
+            "completed",
+            {
+                "output": str(output_path),
+                "data_pack": str(data_pack_path),
+                "digest": digest.hex(),
+                "aes_key": encryption_key.hex(),
+                "hmac_key": hmac_key.hex(),
+            },
+        )
+    else:
+        print(f"匿名化完成 -> 输出视频: {output_path}")
+        print(f"加密数据包: {data_pack_path}")
+        print(f"数据包 HMAC: {digest.hex()}")
+        print(f"AES 密钥 (hex): {encryption_key.hex()}")
+        print(f"HMAC 密钥 (hex): {hmac_key.hex()}")
 
 
 if __name__ == "__main__":
