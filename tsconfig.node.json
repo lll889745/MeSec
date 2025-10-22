@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "module": "ESNext",
+    "types": ["node"],
+    "moduleResolution": "Node"
+  },
+  "include": ["src/main/**/*", "src/preload/**/*"]
+}
