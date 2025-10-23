@@ -1,12 +1,10 @@
 <template>
   <aside class="status-banner">
-    <h2>系统状态</h2>
-    <p>{{ status }}</p>
+    <p class="status-line">{{ status }}</p>
     <div v-if="progressValue !== null" class="progress">
       <div class="progress__bar">
         <div class="progress__fill" :style="{ width: `${progressValue}%` }" />
       </div>
-      <span>{{ progressLabel }}%</span>
     </div>
   </aside>
 </template>
@@ -47,9 +45,9 @@ const progressLabel = computed(() => {
   backdrop-filter: blur(6px);
 }
 
-.status-banner h2 {
-  margin-bottom: 0.75rem;
-  font-size: 1.25rem;
+.status-line {
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
 }
 
 .progress {

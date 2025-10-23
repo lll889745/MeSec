@@ -209,10 +209,10 @@ function sendJobEvent(webContentsId: number, channel: JobChannel, payload: Recor
 async function createWindow(): Promise<void> {
   const browserWindow = new BrowserWindow({
     title: '可逆视频匿名化工具',
-    width: 1200,
-    height: 800,
-    minWidth: 960,
-    minHeight: 600,
+    width: 1000,
+    height: 720,
+    minWidth: 860,
+    minHeight: 640,
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#121212',

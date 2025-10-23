@@ -1,13 +1,10 @@
 <template>
   <main class="home-view">
     <section class="hero">
-      <h1>可逆视频匿名化工具</h1>
-      <p>利用深度学习和加密技术，在保障隐私的同时保留可恢复的原始信息。</p>
     </section>
     <section class="controls">
       <header class="controls__header">
         <h2>处理偏好</h2>
-        <p>根据需求自定义自动检测类别与匿名化风格。</p>
       </header>
       <div class="controls__grid">
         <div class="control-block">
@@ -50,8 +47,8 @@
       </div>
     </section>
     <section class="actions">
-      <VideoDropZone @process="handleProcess" />
-      <StatusBanner :status="statusMessage" :progress="progressValue" />
+  <VideoDropZone @process="handleProcess" />
+  <StatusBanner :status="statusMessage" :progress="progressValue" />
     </section>
     <section v-if="hasLatestOutput" class="results">
       <h2>最近任务输出</h2>

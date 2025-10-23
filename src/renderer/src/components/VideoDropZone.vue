@@ -4,7 +4,7 @@
     @dragover.prevent
     @drop.prevent="handleDrop"
   >
-    <p>拖拽视频文件到此处，或点击选择文件</p>
+  <p>拖拽或选择视频文件开始匿名化</p>
     <input
       ref="fileInput"
       type="file"
@@ -65,16 +65,16 @@ function handleDrop(event: DragEvent) {
 }
 
 button {
-  margin-top: 1.5rem;
-  padding: 0.75rem 1.5rem;
+  margin-top: 1rem;
+  padding: 0.6rem 1.1rem;
   border-radius: 8px;
   border: none;
-  background: #42b883;
+  background: #3ea776;
   color: #fff;
   cursor: pointer;
 }
 
 button:hover {
-  background: #36a173;
+  background: #379e67;
 }
 </style>
