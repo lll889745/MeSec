@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -76,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable YOLO 自动检测，仅保留手动 ROI 处理。",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Worker thread count for frame processing (default: 1).",
+    )
     return parser.parse_args()
 
 
@@ -114,6 +122,101 @@ def ensure_hmac_key(hex_key: Optional[str], fallback: bytes, logger: Optional[Ca
     return fallback
 
 
+@dataclass
+class AnonymizationRequest:
+    input_path: Path
+    output_path: Path
+    data_pack_path: Path
+    device: str = "auto"
+    classes: Optional[Sequence[str]] = None
+    manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None
+    aes_key_hex: Optional[str] = None
+    hmac_key_hex: Optional[str] = None
+    style: str = "blur"
+    disable_detector: bool = False
+    worker_count: int = 1
+
+
+def parse_manual_roi_args(values: Optional[Sequence[str]]) -> Optional[List[Tuple[int, int, int, int]]]:
+    if not values:
+        return None
+    parsed: List[Tuple[int, int, int, int]] = []
+    for spec in values:
+        parts = spec.split(",")
+        if len(parts) != 4:
+            raise ValueError(f"无效的 ROI 格式: {spec}，请使用 x1,y1,x2,y2")
+        try:
+            x1, y1, x2, y2 = (int(p) for p in parts)
+        except ValueError as exc:
+            raise ValueError(f"ROI 坐标必须为整数: {spec}") from exc
+        parsed.append((x1, y1, x2, y2))
+    return parsed
+
+
+def _normalize_manual_rois(
+    rois: Optional[Sequence[Tuple[int, int, int, int]]]
+) -> Optional[List[Tuple[int, int, int, int]]]:
+    if not rois:
+        return None
+    normalized: List[Tuple[int, int, int, int]] = []
+    for roi in rois:
+        x1, y1, x2, y2 = (int(value) for value in roi)
+        normalized.append((x1, y1, x2, y2))
+    return normalized
+
+
+def run_anonymization(
+    model: YOLO,
+    request: AnonymizationRequest,
+    status_callback: Optional[Callable[[str, Dict[str, object]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Dict[str, object]:
+    device = resolve_device(request.device)
+    model.to(device)
+
+    encryption_key = ensure_key(request.aes_key_hex, "AES 密钥", logger=logger)
+    hmac_key = ensure_hmac_key(request.hmac_key_hex, encryption_key, logger=logger)
+
+    target_classes: Optional[Sequence[str]]
+    if request.classes is None:
+        target_classes = None
+    else:
+        target_classes = list(request.classes)
+        if logger and target_classes:
+            logger(f"仅处理类别: {', '.join(target_classes)}")
+        elif logger and not target_classes:
+            logger("未选择自动检测类别，将仅处理手动区域。")
+
+    manual_rois = _normalize_manual_rois(request.manual_rois)
+    if logger and manual_rois:
+        logger(f"手动跟踪 ROI 个数: {len(manual_rois)}")
+
+    digest = run_pipeline(
+        str(request.input_path),
+        str(request.output_path),
+        model,
+        encryption_key,
+        str(request.data_pack_path),
+        hmac_key,
+        target_classes=target_classes,
+        manual_rois=manual_rois,
+        status_callback=status_callback,
+        style=request.style,
+        enable_detection=not request.disable_detector and (target_classes is None or len(target_classes) > 0),
+        worker_count=max(1, request.worker_count),
+        cancel_event=cancel_event,
+    )
+
+    return {
+        "output": str(request.output_path),
+        "data_pack": str(request.data_pack_path),
+        "digest": digest,
+        "aes_key": encryption_key,
+        "hmac_key": hmac_key,
+    }
+
+
 def main() -> None:
     args = parse_args()
     input_path = args.input
@@ -137,38 +240,25 @@ def main() -> None:
         else:
             print(message)
 
-    device = resolve_device(args.device)
-    log(f"加载模型 {args.model} 到 {device} 设备")
+    classes = list(args.classes) if args.classes is not None else None
+    manual_rois = parse_manual_roi_args(args.manual_roi)
+
+    request = AnonymizationRequest(
+        input_path=input_path,
+        output_path=output_path,
+        data_pack_path=data_pack_path,
+        device=args.device,
+        classes=classes,
+        manual_rois=manual_rois,
+        aes_key_hex=args.key,
+        hmac_key_hex=args.hmac_key,
+        style=args.style,
+        disable_detector=args.disable_detector,
+        worker_count=max(1, args.workers),
+    )
+
+    log(f"加载模型 {args.model} 到 {resolve_device(args.device)} 设备")
     model = YOLO(str(args.model))
-    model.to(device)
-
-    encryption_key = ensure_key(args.key, "AES 密钥", logger=log)
-    hmac_key = ensure_hmac_key(args.hmac_key, encryption_key, logger=log)
-
-    target_classes: Optional[Sequence[str]]
-    if args.classes is None:
-        target_classes = None
-    else:
-        target_classes = list(args.classes)
-        if target_classes:
-            log(f"仅处理类别: {', '.join(target_classes)}")
-        else:
-            log("未选择自动检测类别，将仅处理手动区域。")
-
-    manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None
-    if args.manual_roi:
-        parsed: List[Tuple[int, int, int, int]] = []
-        for spec in args.manual_roi:
-            parts = spec.split(",")
-            if len(parts) != 4:
-                raise ValueError(f"无效的 ROI 格式: {spec}，请使用 x1,y1,x2,y2")
-            try:
-                x1, y1, x2, y2 = (int(p) for p in parts)
-            except ValueError as exc:
-                raise ValueError(f"ROI 坐标必须为整数: {spec}") from exc
-            parsed.append((x1, y1, x2, y2))
-        manual_rois = parsed
-        log(f"手动跟踪 ROI 个数: {len(parsed)}")
 
     def status_callback(event: str, data: Dict[str, object]) -> None:
         if json_mode:
@@ -182,23 +272,21 @@ def main() -> None:
             print(f"进度: {processed}/{total or '?'} ({percent:.2f}%)")
 
     try:
-        digest = run_pipeline(
-            str(input_path),
-            str(output_path),
+        result = run_anonymization(
             model,
-            encryption_key,
-            str(data_pack_path),
-            hmac_key,
-            target_classes=target_classes,
-            manual_rois=manual_rois,
+            request,
             status_callback=status_callback,
-            style=args.style,
-            enable_detection=not args.disable_detector and (target_classes is None or len(target_classes) > 0),
+            cancel_event=None,
+            logger=log,
         )
     except Exception as exc:  # pragma: no cover - integration error path
         if json_mode:
             emit_event("error", {"message": str(exc)})
         raise
+
+    digest_bytes = result["digest"]
+    aes_key = result["aes_key"]
+    hmac_key = result["hmac_key"]
 
     if json_mode:
         emit_event(
@@ -206,16 +294,16 @@ def main() -> None:
             {
                 "output": str(output_path),
                 "data_pack": str(data_pack_path),
-                "digest": digest.hex(),
-                "aes_key": encryption_key.hex(),
+                "digest": digest_bytes.hex(),
+                "aes_key": aes_key.hex(),
                 "hmac_key": hmac_key.hex(),
             },
         )
     else:
         print(f"匿名化完成 -> 输出视频: {output_path}")
         print(f"加密数据包: {data_pack_path}")
-        print(f"数据包 HMAC: {digest.hex()}")
-        print(f"AES 密钥 (hex): {encryption_key.hex()}")
+        print(f"数据包 HMAC: {digest_bytes.hex()}")
+        print(f"AES 密钥 (hex): {aes_key.hex()}")
         print(f"HMAC 密钥 (hex): {hmac_key.hex()}")
 
 

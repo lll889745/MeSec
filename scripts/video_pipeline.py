@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+from concurrent.futures import CancelledError
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -29,7 +30,13 @@ def _create_tracker() -> cv2.Tracker:
     raise RuntimeError("当前 OpenCV 安装不支持 CSRT 跟踪器，请安装 opencv-contrib-python >= 4.5")
 
 
-def producer(video_path: str, frame_queue: Queue, sentinel: Optional[object] = None, worker_count: int = 1) -> None:
+def producer(
+    video_path: str,
+    frame_queue: Queue,
+    sentinel: Optional[object] = None,
+    worker_count: int = 1,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
     """Read frames from a video file and enqueue them for processing."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -42,6 +49,8 @@ def producer(video_path: str, frame_queue: Queue, sentinel: Optional[object] = N
             if not success:
                 break
             frame_queue.put((frame_index, frame))
+            if cancel_event and cancel_event.is_set():
+                break
             frame_index += 1
     finally:
         cap.release()
@@ -109,6 +118,13 @@ def apply_obfuscation(frame: np.ndarray, bbox: Tuple[int, int, int, int], style:
     _apply_gaussian_blur(frame, bbox)
 
 
+def _run_model(model, frame: np.ndarray):
+    try:
+        return model(frame, verbose=False)
+    except TypeError:
+        return model(frame)
+
+
 def _safe_callback(callback: Optional[Callable[[str, Dict[str, Any]], None]], event: str, data: Dict[str, Any]) -> None:
     if not callback:
         return
@@ -129,6 +145,8 @@ def worker(
     status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     style: str = "blur",
     enable_detection: bool = True,
+    cancel_event: Optional[threading.Event] = None,
+    model_lock: Optional[threading.Lock] = None,
 ) -> None:
     """Consume raw frames, run detection/anonymization, and enqueue results."""
     default_classes = ("person", "car", "truck", "bus", "motorcycle", "motorbike")
@@ -143,6 +161,8 @@ def worker(
     while True:
         item = frame_queue.get()
         try:
+            if cancel_event and cancel_event.is_set():
+                break
             if item is sentinel:
                 break
 
@@ -174,10 +194,11 @@ def worker(
                 trackers_initialized = True
 
             if enable_detection and sensitive_classes:
-                try:
-                    results = model(processed_frame, verbose=False)
-                except TypeError:
-                    results = model(processed_frame)
+                if model_lock is not None:
+                    with model_lock:
+                        results = _run_model(model, processed_frame)
+                else:
+                    results = _run_model(model, processed_frame)
             else:
                 results = []
 
@@ -281,6 +302,9 @@ def worker(
             if detection_metadata:
                 metadata.extend(detection_metadata)
 
+            if cancel_event and cancel_event.is_set():
+                break
+
             processed_queue.put((frame_index, processed_frame, metadata))
         finally:
             frame_queue.task_done()
@@ -298,6 +322,8 @@ def consumer(
     sentinel: Optional[object] = None,
     status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     total_frames: int = 0,
+    cancel_event: Optional[threading.Event] = None,
+    worker_count: int = 1,
 ) -> None:
     """Write processed frames to an output video file until sentinel is received."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -307,12 +333,19 @@ def consumer(
 
     processed_count = 0
 
+    remaining_sentinels = max(1, worker_count)
+
     try:
         while True:
             item = processed_queue.get()
             try:
                 if item is sentinel:
-                    break
+                    remaining_sentinels -= 1
+                    if remaining_sentinels <= 0:
+                        break
+                    continue
+                if cancel_event and cancel_event.is_set():
+                    continue
                 frame_index, processed_frame, metadata = item  # type: ignore[misc]
                 if data_pack_writer is not None and metadata:
                     data_pack_writer.write_frame_data(frame_index, metadata)
@@ -345,11 +378,14 @@ def run_pipeline(
     status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     style: str = "blur",
     enable_detection: bool = True,
+    worker_count: int = 1,
+    cancel_event: Optional[threading.Event] = None,
 ) -> bytes:
     frame_queue: Queue = Queue(maxsize=32)
     processed_queue: Queue = Queue(maxsize=32)
     sentinel = object()
-    num_workers = 1
+    num_workers = max(1, int(worker_count))
+    model_lock = threading.Lock() if num_workers > 1 else None
 
     # Probe video metadata for the consumer
     tmp_cap = cv2.VideoCapture(video_path)
@@ -381,25 +417,30 @@ def run_pipeline(
 
     producer_thread = threading.Thread(
         target=producer,
-        args=(video_path, frame_queue, sentinel, num_workers),
+        args=(video_path, frame_queue, sentinel, num_workers, cancel_event),
         daemon=True,
     )
-    worker_thread = threading.Thread(
-        target=worker,
-        args=(
-            frame_queue,
-            processed_queue,
-            model,
-            encryption_key,
-            sentinel,
-            target_classes,
-            manual_rois,
-            status_callback,
-            style,
-            enable_detection,
-        ),
-        daemon=True,
-    )
+    worker_threads = [
+        threading.Thread(
+            target=worker,
+            args=(
+                frame_queue,
+                processed_queue,
+                model,
+                encryption_key,
+                sentinel,
+                target_classes,
+                manual_rois,
+                status_callback,
+                style,
+                enable_detection,
+                cancel_event,
+                model_lock,
+            ),
+            daemon=True,
+        )
+        for _ in range(num_workers)
+    ]
     consumer_thread = threading.Thread(
         target=consumer,
         args=(
@@ -411,18 +452,22 @@ def run_pipeline(
             sentinel,
             status_callback,
             total_frames,
+            cancel_event,
+            num_workers,
         ),
         daemon=True,
     )
 
     producer_thread.start()
-    worker_thread.start()
+    for thread in worker_threads:
+        thread.start()
     consumer_thread.start()
 
     producer_thread.join()
     frame_queue.join()
     processed_queue.join()
-    worker_thread.join()
+    for thread in worker_threads:
+        thread.join()
     consumer_thread.join()
 
     _safe_callback(status_callback, "finalizing", {})
@@ -433,6 +478,9 @@ def run_pipeline(
         data_pack_writer.close()
 
     _safe_callback(status_callback, "finalized", {"digest": digest.hex()})
+
+    if cancel_event and cancel_event.is_set():
+        raise CancelledError()
 
     return digest
 
@@ -449,4 +497,12 @@ if __name__ == "__main__":
     dummy_model = IdentityModel()
     key = os.urandom(32)
     hmac_key = os.urandom(32)
-    run_pipeline("input.mp4", "output.mp4", dummy_model, key, "encrypted_data.pack", hmac_key)
+    run_pipeline(
+        "input.mp4",
+        "output.mp4",
+        dummy_model,
+        key,
+        "encrypted_data.pack",
+        hmac_key,
+        worker_count=1,
+    )

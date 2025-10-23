@@ -3,7 +3,7 @@ import { ChildProcess, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync } from 'fs';
 import { basename, dirname, extname, join } from 'path';
-import { release } from 'os';
+import { cpus, release } from 'os';
 
 // Disable GPU acceleration on Windows 7 to avoid issues with transparency APIs.
 if (release().startsWith('6.1')) {
@@ -33,6 +33,7 @@ type AnonymizeStartOptions = {
   hmacKey?: string;
   style?: string;
   disableDetection?: boolean;
+  workerCount?: number;
 };
 
 type RestoreStartOptions = {
@@ -45,12 +46,21 @@ type RestoreStartOptions = {
 };
 
 type RunningJob = {
-  process: ChildProcess;
+  process?: ChildProcess;
+  service?: 'anonymize';
   webContentsId: number;
   channel: JobChannel;
 };
 
 const runningJobs = new Map<string, RunningJob>();
+
+type ServiceJob = {
+  webContentsId: number;
+};
+
+let anonymizeService: ChildProcess | null = null;
+let anonymizeServiceStdoutBuffer = '';
+const anonymizeServiceJobs = new Map<string, ServiceJob>();
 
 function getPythonExecutable(explicit?: string): string {
   if (explicit && explicit.trim().length > 0) {
@@ -83,6 +93,109 @@ function ensureParentDir(path: string): void {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+}
+
+function handleServicePayload(payload: Record<string, unknown>): void {
+  const event = String(payload.event ?? '');
+  if (!event) {
+    return;
+  }
+  if (event === 'service_error') {
+    console.warn('[anonymize-service]', payload.message);
+    return;
+  }
+  const jobId = typeof payload.jobId === 'string' ? payload.jobId : undefined;
+  if (!jobId) {
+    return;
+  }
+  const jobEntry = anonymizeServiceJobs.get(jobId);
+  const runningJob = runningJobs.get(jobId);
+  if (!jobEntry || !runningJob) {
+    return;
+  }
+  sendJobEvent(jobEntry.webContentsId, runningJob.channel, payload);
+  if (event === 'exit') {
+    anonymizeServiceJobs.delete(jobId);
+    runningJobs.delete(jobId);
+  }
+}
+
+function ensureAnonymizeService(pythonExecutable: string, pythonEnv: NodeJS.ProcessEnv): ChildProcess {
+  if (anonymizeService && !anonymizeService.killed) {
+    return anonymizeService;
+  }
+
+  const servicePath = resolveScriptPath('anonymize_service.py');
+  const child = spawn(pythonExecutable, [servicePath], {
+    cwd: dirname(servicePath),
+    env: pythonEnv,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  anonymizeService = child;
+  anonymizeServiceStdoutBuffer = '';
+
+  if (child.stdout) {
+    child.stdout.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      anonymizeServiceStdoutBuffer += chunk;
+      const parts = anonymizeServiceStdoutBuffer.split(/\r?\n/);
+      anonymizeServiceStdoutBuffer = parts.pop() ?? '';
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line) {
+          continue;
+        }
+        try {
+          const payload = JSON.parse(line) as Record<string, unknown>;
+          handleServicePayload(payload);
+        } catch (error) {
+          console.warn('[anonymize-service] Failed to parse line', line, error);
+        }
+      }
+    });
+  }
+
+  if (child.stderr) {
+    child.stderr.setEncoding('utf-8');
+    child.stderr.on('data', (chunk: string) => {
+      const message = chunk.toString().trim();
+      if (message) {
+        console.warn('[anonymize-service stderr]', message);
+      }
+    });
+  }
+
+  child.on('exit', (code, signal) => {
+    anonymizeService = null;
+    anonymizeServiceStdoutBuffer = '';
+    if (anonymizeServiceJobs.size > 0) {
+      for (const [jobId, job] of anonymizeServiceJobs.entries()) {
+        sendJobEvent(job.webContentsId, 'anonymize', {
+          jobId,
+          event: 'error',
+          message: `匿名服务中断，退出码 ${code ?? '未知'}`
+        });
+        sendJobEvent(job.webContentsId, 'anonymize', {
+          jobId,
+          event: 'exit',
+          code,
+          signal
+        });
+        runningJobs.delete(jobId);
+      }
+      anonymizeServiceJobs.clear();
+    }
+  });
+
+  return child;
+}
+
+function sendServiceCommand(command: Record<string, unknown>): void {
+  if (!anonymizeService || !anonymizeService.stdin) {
+    throw new Error('Anonymization service is not running');
+  }
+  anonymizeService.stdin.write(`${JSON.stringify(command)}\n`);
 }
 
 function sendJobEvent(webContentsId: number, channel: JobChannel, payload: Record<string, unknown>): void {
@@ -166,11 +279,28 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  for (const { process: child } of runningJobs.values()) {
+  if (anonymizeService) {
     try {
-      child.kill();
+      sendServiceCommand({ type: 'shutdown' });
     } catch (error) {
-      console.warn('[main] Failed to terminate child process', error);
+      console.warn('[main] Failed to send shutdown to anonymize service', error);
+    }
+    try {
+      anonymizeService.kill();
+    } catch (error) {
+      console.warn('[main] Failed to terminate anonymize service', error);
+    }
+    anonymizeService = null;
+    anonymizeServiceJobs.clear();
+  }
+
+  for (const job of runningJobs.values()) {
+    if (job.process) {
+      try {
+        job.process.kill();
+      } catch (error) {
+        console.warn('[main] Failed to terminate child process', error);
+      }
     }
   }
   runningJobs.clear();
@@ -197,49 +327,6 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
   ensureParentDir(outputPath);
   ensureParentDir(dataPackPath);
 
-  const args: string[] = [
-    scriptPath,
-    inputPath,
-    '--output',
-    outputPath,
-    '--data-pack',
-    dataPackPath,
-    '--device',
-    options.device ?? 'auto',
-    '--json-progress'
-  ];
-
-  if (options.modelPath) {
-    args.push('--model', options.modelPath);
-  }
-
-  if (options.classes && options.classes.length > 0) {
-    args.push('--classes', ...options.classes);
-  }
-
-  if (options.manualRois && options.manualRois.length > 0) {
-    for (const roi of options.manualRois) {
-      const normalized = roi.map((value) => Math.round(Number(value))) as [number, number, number, number];
-      args.push('--manual-roi', normalized.join(','));
-    }
-  }
-
-  if (options.aesKey) {
-    args.push('--key', options.aesKey);
-  }
-
-  if (options.hmacKey) {
-    args.push('--hmac-key', options.hmacKey);
-  }
-
-  if (options.style) {
-    args.push('--style', options.style);
-  }
-
-  if (options.disableDetection) {
-    args.push('--disable-detector');
-  }
-
   const pythonEnv = {
     ...process.env,
     PYTHONIOENCODING: 'utf-8'
@@ -247,76 +334,57 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
 
   const jobId = randomUUID();
   const webContentsId = event.sender.id;
+  const manualRoisPayload = options.manualRois?.map((roi) =>
+    roi.map((value) => Math.round(Number(value)))
+  ) as Array<[number, number, number, number]> | undefined;
 
-  const child = spawn(pythonExecutable, args, {
-    cwd: dirname(scriptPath),
-    env: pythonEnv,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
+  const cpuCount = cpus().length || 1;
+  const suggestedWorkers = options.disableDetection ? 1 : Math.min(2, Math.max(1, cpuCount - 1));
+  const workerCount = Math.max(1, options.workerCount ?? suggestedWorkers);
+
+  try {
+    ensureAnonymizeService(pythonExecutable, pythonEnv);
+  } catch (error) {
+    throw new Error(`无法启动匿名服务: ${(error as Error).message}`);
+  }
+
+  const payload: Record<string, unknown> = {
+    inputPath,
+    outputPath,
+    dataPackPath,
+    device: options.device ?? 'auto',
+    workerCount,
+    disableDetection: Boolean(options.disableDetection)
+  };
+
+  if (options.modelPath) {
+    payload.modelPath = options.modelPath;
+  }
+  if (typeof options.classes !== 'undefined') {
+    payload.classes = options.classes;
+  }
+  if (manualRoisPayload && manualRoisPayload.length > 0) {
+    payload.manualRois = manualRoisPayload;
+  }
+  if (options.aesKey) {
+    payload.aesKey = options.aesKey;
+  }
+  if (options.hmacKey) {
+    payload.hmacKey = options.hmacKey;
+  }
+  if (options.style) {
+    payload.style = options.style;
+  }
+
+  try {
+    sendServiceCommand({ type: 'start', jobId, payload });
+  } catch (error) {
+    throw new Error(`匿名服务请求失败: ${(error as Error).message}`);
+  }
 
   const channel: JobChannel = 'anonymize';
-  runningJobs.set(jobId, { process: child, webContentsId, channel });
-
-  sendJobEvent(webContentsId, channel, {
-    jobId,
-    event: 'started',
-    input: inputPath,
-    output: outputPath,
-    data_pack: dataPackPath
-  });
-
-  let stdoutBuffer = '';
-
-  if (child.stdout) {
-    child.stdout.setEncoding('utf-8');
-    child.stdout.on('data', (chunk: string) => {
-      stdoutBuffer += chunk;
-      const parts = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = parts.pop() ?? '';
-      for (const part of parts) {
-        const line = part.trim();
-        if (!line) {
-          continue;
-        }
-        try {
-          const payload = JSON.parse(line) as Record<string, unknown>;
-          sendJobEvent(webContentsId, channel, { jobId, ...payload });
-        } catch (error) {
-          console.warn('[main] Failed to parse progress line', line, error);
-          sendJobEvent(webContentsId, channel, { jobId, event: 'log', message: line });
-        }
-      }
-    });
-  }
-
-  if (child.stderr) {
-    child.stderr.setEncoding('utf-8');
-    child.stderr.on('data', (chunk: string) => {
-      const message = chunk.toString().trim();
-      if (message) {
-        sendJobEvent(webContentsId, channel, { jobId, event: 'log', stream: 'stderr', message });
-      }
-    });
-  }
-
-  child.on('error', (error) => {
-    sendJobEvent(webContentsId, channel, { jobId, event: 'error', message: error.message });
-  });
-
-  child.on('close', (code, signal) => {
-    runningJobs.delete(jobId);
-
-    if (stdoutBuffer.trim().length > 0) {
-      try {
-        const payload = JSON.parse(stdoutBuffer.trim()) as Record<string, unknown>;
-        sendJobEvent(webContentsId, channel, { jobId, ...payload });
-      } catch (error) {
-        sendJobEvent(webContentsId, channel, { jobId, event: 'log', message: stdoutBuffer.trim() });
-      }
-    }
-
-    sendJobEvent(webContentsId, channel, { jobId, event: 'exit', code, signal });
-  });
+  runningJobs.set(jobId, { service: 'anonymize', webContentsId, channel });
+  anonymizeServiceJobs.set(jobId, { webContentsId });
 
   return {
     jobId,
@@ -330,9 +398,27 @@ ipcMain.handle('anonymize:cancel', async (_event, jobId: string) => {
   if (!job) {
     return false;
   }
-  job.process.kill();
-  runningJobs.delete(jobId);
-  sendJobEvent(job.webContentsId, job.channel, { jobId, event: 'cancelled' });
+  if (job.service === 'anonymize') {
+    try {
+      sendServiceCommand({ type: 'cancel', jobId });
+    } catch (error) {
+      console.warn('[main] Failed to cancel anonymize job via service', error);
+      sendJobEvent(job.webContentsId, job.channel, {
+        jobId,
+        event: 'error',
+        message: '无法取消匿名任务'
+      });
+      return false;
+    }
+    return true;
+  }
+
+  if (job.process) {
+    job.process.kill();
+    runningJobs.delete(jobId);
+    sendJobEvent(job.webContentsId, job.channel, { jobId, event: 'cancelled' });
+    return true;
+  }
   return true;
 });
 
@@ -465,10 +551,13 @@ ipcMain.handle('restore:cancel', async (_event, jobId: string) => {
   if (!job) {
     return false;
   }
-  job.process.kill();
-  runningJobs.delete(jobId);
-  sendJobEvent(job.webContentsId, job.channel, { jobId, event: 'cancelled' });
-  return true;
+  if (job.process) {
+    job.process.kill();
+    runningJobs.delete(jobId);
+    sendJobEvent(job.webContentsId, job.channel, { jobId, event: 'cancelled' });
+    return true;
+  }
+  return false;
 });
 
 ipcMain.handle('ping', async () => {
