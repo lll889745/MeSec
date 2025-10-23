@@ -324,8 +324,11 @@ function handleAnonymizeEvent(payload: JobEventPayload): void {
     }
     case 'exit': {
       const code = payload.code as number | undefined;
-      if (isProcessing.value && code && code !== 0) {
+      const currentJobId = activeJobId.value;
+      if (code && code !== 0) {
         statusMessage.value = `任务异常结束 (退出码 ${code})`;
+      }
+      if (currentJobId === payload.jobId) {
         isProcessing.value = false;
         activeJobId.value = null;
         activeJobType.value = null;
@@ -408,8 +411,11 @@ function handleRestoreEvent(payload: JobEventPayload): void {
     }
     case 'exit': {
       const code = payload.code as number | undefined;
-      if (isProcessing.value && code && code !== 0) {
+      const currentJobId = activeJobId.value;
+      if (code && code !== 0) {
         statusMessage.value = `恢复任务异常结束 (退出码 ${code})`;
+      }
+      if (currentJobId === payload.jobId) {
         isProcessing.value = false;
         activeJobId.value = null;
         activeJobType.value = null;

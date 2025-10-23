@@ -35,12 +35,18 @@ function handleFileSelect(event: Event) {
   if (file) {
     emit('process', file);
   }
+  if (target) {
+    target.value = '';
+  }
 }
 
 function handleDrop(event: DragEvent) {
   const file = event.dataTransfer?.files?.item(0);
   if (file) {
     emit('process', file);
+    if (fileInput.value) {
+      fileInput.value.value = '';
+    }
   }
 }
 </script>
