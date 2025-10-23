@@ -11,6 +11,8 @@ export type AnonymizeStartOptions = {
   modelPath?: string;
   aesKey?: string;
   hmacKey?: string;
+  style?: string;
+  disableDetection?: boolean;
 };
 
 export type AnonymizeEventPayload = {

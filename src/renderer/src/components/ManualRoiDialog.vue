@@ -21,15 +21,6 @@
       <section v-else class="frame-section frame-section--loading">
         <p>正在加载视频首帧...</p>
       </section>
-      <section class="options-section">
-        <h3>检测类别</h3>
-        <div class="options-grid">
-          <label v-for="cls in allClasses" :key="cls">
-            <input type="checkbox" :value="cls" v-model="selectedClasses" />
-            <span>{{ cls }}</span>
-          </label>
-        </div>
-      </section>
       <section class="roi-list">
         <header>
           <h3>手动区域 ({{ rois.length }})</h3>
@@ -59,7 +50,7 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, toRefs, watch } from 'vue';
 
 type Roi = { id: number; x1: number; y1: number; x2: number; y2: number };
-type RoiPayload = { classes: string[]; manualRois: Array<[number, number, number, number]> };
+type RoiPayload = { manualRois: Array<[number, number, number, number]> };
 
 type Props = {
   visible: boolean;
@@ -76,8 +67,6 @@ const { visible } = toRefs(props);
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const frameUrl = ref<string>('');
-const allClasses = ['person', 'car', 'truck', 'bus', 'motorcycle', 'motorbike'];
-const selectedClasses = ref<string[]>([...allClasses]);
 const rois = ref<Roi[]>([]);
 const drawingState = reactive({ active: false, pointerId: 0, startX: 0, startY: 0, currentX: 0, currentY: 0 });
 const videoSize = reactive({ width: 0, height: 0 });
@@ -116,6 +105,7 @@ onBeforeUnmount(() => {
 });
 
 function cleanup(): void {
+  resetRois();
   if (objectUrl) {
     URL.revokeObjectURL(objectUrl);
     objectUrl = null;
@@ -373,7 +363,6 @@ function cancel(): void {
 
 function confirm(): void {
   const payload: RoiPayload = {
-    classes: [...selectedClasses.value],
     manualRois: rois.value.map((roi) => [roi.x1, roi.y1, roi.x2, roi.y2])
   };
   emit('confirm', payload);
@@ -446,24 +435,8 @@ function confirm(): void {
   cursor: crosshair;
 }
 
-.options-section h3,
 .roi-list h3 {
   margin-bottom: 0.75rem;
-}
-
-.options-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 0.75rem;
-}
-
-.options-grid label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.05);
 }
 
 .roi-list header {

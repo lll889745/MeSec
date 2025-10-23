@@ -15,6 +15,8 @@ declare global {
 				modelPath?: string;
 				aesKey?: string;
 				hmacKey?: string;
+					style?: string;
+					disableDetection?: boolean;
 			}) => Promise<{ jobId: string; outputPath: string; dataPackPath: string }>;
 			cancelAnonymize: (jobId: string) => Promise<boolean>;
 			onAnonymizeEvent: (

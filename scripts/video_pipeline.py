@@ -62,8 +62,7 @@ def encrypt_roi(roi: np.ndarray, key: bytes) -> bytes:
     return nonce + ciphertext + encryptor.tag
 
 
-def anonymize_region(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
-    """Apply Gaussian blur to the specified bounding box region of the frame."""
+def _apply_gaussian_blur(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
     x1, y1, x2, y2 = bbox
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
@@ -71,6 +70,43 @@ def anonymize_region(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None
     ksize = max(5, (min(roi.shape[0], roi.shape[1]) // 2) * 2 + 1)
     blurred = cv2.GaussianBlur(roi, (ksize, ksize), 0)
     frame[y1:y2, x1:x2] = blurred
+
+
+def _apply_mosaic(frame: np.ndarray, bbox: Tuple[int, int, int, int], cell_size: int = 14) -> None:
+    x1, y1, x2, y2 = bbox
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return
+    h, w = roi.shape[:2]
+    grid_w = max(1, w // cell_size)
+    grid_h = max(1, h // cell_size)
+    small = cv2.resize(roi, (grid_w, grid_h), interpolation=cv2.INTER_LINEAR)
+    mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    frame[y1:y2, x1:x2] = mosaic
+
+
+def _apply_pixelate(frame: np.ndarray, bbox: Tuple[int, int, int, int], scale: float = 0.15) -> None:
+    x1, y1, x2, y2 = bbox
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return
+    h, w = roi.shape[:2]
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    small = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pixelated = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    frame[y1:y2, x1:x2] = pixelated
+
+
+def apply_obfuscation(frame: np.ndarray, bbox: Tuple[int, int, int, int], style: str) -> None:
+    style_normalized = style.lower()
+    if style_normalized == "mosaic":
+        _apply_mosaic(frame, bbox)
+        return
+    if style_normalized == "pixelate":
+        _apply_pixelate(frame, bbox)
+        return
+    _apply_gaussian_blur(frame, bbox)
 
 
 def _safe_callback(callback: Optional[Callable[[str, Dict[str, Any]], None]], event: str, data: Dict[str, Any]) -> None:
@@ -91,9 +127,16 @@ def worker(
     target_classes: Optional[Sequence[str]] = None,
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
     status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    style: str = "blur",
+    enable_detection: bool = True,
 ) -> None:
     """Consume raw frames, run detection/anonymization, and enqueue results."""
-    sensitive_classes = set(target_classes or ("person", "car", "truck", "bus", "motorcycle", "motorbike"))
+    default_classes = ("person", "car", "truck", "bus", "motorcycle", "motorbike")
+    if target_classes is None:
+        sensitive_classes = set(default_classes)
+    else:
+        sensitive_classes = set(target_classes)
+    style_mode = style.lower() if style else "blur"
     tracker_entries: List[Dict[str, object]] = []
     trackers_initialized = False
 
@@ -130,11 +173,16 @@ def worker(
                     )
                 trackers_initialized = True
 
-            try:
-                results = model(processed_frame, verbose=False)
-            except TypeError:
-                results = model(processed_frame)
+            if enable_detection and sensitive_classes:
+                try:
+                    results = model(processed_frame, verbose=False)
+                except TypeError:
+                    results = model(processed_frame)
+            else:
+                results = []
+
             metadata: List[Dict[str, object]] = []
+            detection_metadata: List[Dict[str, object]] = []
 
             manual_metadata: List[Dict[str, object]] = []
             active_trackers: List[Dict[str, object]] = []
@@ -153,7 +201,7 @@ def worker(
 
                 roi = frame[y1:y2, x1:x2]
                 encrypted_blob = encrypt_roi(roi, encryption_key)
-                anonymize_region(processed_frame, (x1, y1, x2, y2))
+                apply_obfuscation(processed_frame, (x1, y1, x2, y2), style_mode)
 
                 block = {
                     "label": entry.get("id", "manual"),
@@ -207,7 +255,7 @@ def worker(
 
                     roi = frame[y1:y2, x1:x2]
                     encrypted_blob = encrypt_roi(roi, encryption_key)
-                    anonymize_region(processed_frame, (x1, y1, x2, y2))
+                    apply_obfuscation(processed_frame, (x1, y1, x2, y2), style_mode)
 
                     block = {
                         "label": label,
@@ -216,7 +264,7 @@ def worker(
                         "encrypted": encrypted_blob,
                         "source": "detection",
                     }
-                    metadata.append(block)
+                    detection_metadata.append(block)
                     _safe_callback(
                         status_callback,
                         "detection",
@@ -230,6 +278,8 @@ def worker(
 
             if manual_metadata:
                 metadata.extend(manual_metadata)
+            if detection_metadata:
+                metadata.extend(detection_metadata)
 
             processed_queue.put((frame_index, processed_frame, metadata))
         finally:
@@ -293,6 +343,8 @@ def run_pipeline(
     target_classes: Optional[Sequence[str]] = None,
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None,
     status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    style: str = "blur",
+    enable_detection: bool = True,
 ) -> bytes:
     frame_queue: Queue = Queue(maxsize=32)
     processed_queue: Queue = Queue(maxsize=32)
@@ -343,6 +395,8 @@ def run_pipeline(
             target_classes,
             manual_rois,
             status_callback,
+            style,
+            enable_detection,
         ),
         daemon=True,
     )

@@ -4,6 +4,51 @@
       <h1>可逆视频匿名化工具</h1>
       <p>利用深度学习和加密技术，在保障隐私的同时保留可恢复的原始信息。</p>
     </section>
+    <section class="controls">
+      <header class="controls__header">
+        <h2>处理偏好</h2>
+        <p>根据需求自定义自动检测类别与匿名化风格。</p>
+      </header>
+      <div class="controls__grid">
+        <div class="control-block">
+          <h3>检测设置</h3>
+          <label class="toggle">
+            <input type="checkbox" v-model="detectionEnabled" />
+            <span>启用自动目标检测</span>
+          </label>
+          <p class="hint" v-if="!detectionEnabled">当前仅使用手动选区进行处理。</p>
+        </div>
+        <div class="control-block">
+          <h3>检测类别</h3>
+          <div class="class-list" :class="{ 'class-list--disabled': !detectionEnabled }">
+            <label
+              v-for="item in availableClasses"
+              :key="item.id"
+              class="class-option"
+            >
+              <input
+                type="checkbox"
+                :value="item.id"
+                v-model="selectedClassIds"
+                :disabled="!detectionEnabled"
+              />
+              <span>{{ item.label }} <small>({{ item.id }})</small></span>
+            </label>
+          </div>
+          <p class="hint" v-if="detectionEnabled && !selectedClassIds.length">
+            未选择类别时将自动禁用检测，仅保留手动区域。
+          </p>
+        </div>
+        <div class="control-block">
+          <h3>匿名化风格</h3>
+          <select v-model="selectedStyle">
+            <option v-for="style in obfuscationStyles" :key="style.value" :value="style.value">
+              {{ style.label }}
+            </option>
+          </select>
+        </div>
+      </div>
+    </section>
     <section class="actions">
       <VideoDropZone @process="handleProcess" />
       <StatusBanner :status="statusMessage" :progress="progressValue" />
@@ -85,6 +130,22 @@ const activeJobType = ref<'anonymize' | 'restore' | null>(null);
 const eventUnsubscribe = ref<(() => void) | null>(null);
 const restoreEventUnsubscribe = ref<(() => void) | null>(null);
 const latestOutput = ref<LatestOutput>({});
+const availableClasses = [
+  { id: 'person', label: '行人' },
+  { id: 'car', label: '小客车' },
+  { id: 'truck', label: '卡车' },
+  { id: 'bus', label: '公交车' },
+  { id: 'motorcycle', label: '摩托车' },
+  { id: 'bicycle', label: '自行车' }
+];
+const selectedClassIds = ref<string[]>(availableClasses.map((item) => item.id));
+const detectionEnabled = ref(true);
+const obfuscationStyles = [
+  { value: 'blur', label: '高斯模糊' },
+  { value: 'pixelate', label: '像素化' },
+  { value: 'mosaic', label: '马赛克' }
+];
+const selectedStyle = ref(obfuscationStyles[0].value);
 
 const progressValue = computed(() => {
   if (!isProcessing.value) {
@@ -129,7 +190,7 @@ function handleDialogCancel(): void {
   statusMessage.value = '已取消选择';
 }
 
-async function handleDialogConfirm(payload: { classes: string[]; manualRois: Array<[number, number, number, number]> }): Promise<void> {
+async function handleDialogConfirm(payload: { manualRois: Array<[number, number, number, number]> }): Promise<void> {
   const file = selectedFile.value;
   showManualDialog.value = false;
   if (!file?.path) {
@@ -144,11 +205,16 @@ async function handleDialogConfirm(payload: { classes: string[]; manualRois: Arr
   activeJobType.value = 'anonymize';
   latestOutput.value = {};
 
+  const effectiveClasses = detectionEnabled.value ? [...selectedClassIds.value] : [];
+  const disableDetection = !detectionEnabled.value || effectiveClasses.length === 0;
+
   try {
     const response = await window.electronAPI.startAnonymize({
       inputPath: file.path,
-      classes: payload.classes.length ? payload.classes : undefined,
-      manualRois: payload.manualRois.length ? payload.manualRois : undefined
+      classes: disableDetection ? undefined : effectiveClasses,
+      manualRois: payload.manualRois.length ? payload.manualRois : undefined,
+      disableDetection,
+      style: selectedStyle.value
     });
     selectedFile.value = null;
     activeJobId.value = response.jobId;
@@ -412,6 +478,73 @@ onBeforeUnmount(() => {
 
 .hero h1 {
   margin-bottom: 0.5rem;
+}
+
+.controls {
+  border-radius: 12px;
+  padding: 1.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.controls__header h2 {
+  margin-bottom: 0.25rem;
+}
+
+.controls__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1.25rem;
+}
+
+.control-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.class-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.class-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.class-option small {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.class-list--disabled {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.control-block select {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: #fff;
+  padding: 0.6rem 0.75rem;
+}
+
+.control-block .hint {
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 0.85rem;
 }
 
 .actions {

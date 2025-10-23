@@ -64,6 +64,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Emit progress events as JSON lines for external integration.",
     )
+    parser.add_argument(
+        "--style",
+        type=str,
+        choices=["blur", "mosaic", "pixelate"],
+        default="blur",
+        help="Obfuscation style to apply inside detections/ROIs (default: blur).",
+    )
+    parser.add_argument(
+        "--disable-detector",
+        action="store_true",
+        help="Disable YOLO 自动检测，仅保留手动 ROI 处理。",
+    )
     return parser.parse_args()
 
 
@@ -133,9 +145,15 @@ def main() -> None:
     encryption_key = ensure_key(args.key, "AES 密钥", logger=log)
     hmac_key = ensure_hmac_key(args.hmac_key, encryption_key, logger=log)
 
-    target_classes: Optional[Sequence[str]] = args.classes
-    if target_classes:
-        log(f"仅处理类别: {', '.join(target_classes)}")
+    target_classes: Optional[Sequence[str]]
+    if args.classes is None:
+        target_classes = None
+    else:
+        target_classes = list(args.classes)
+        if target_classes:
+            log(f"仅处理类别: {', '.join(target_classes)}")
+        else:
+            log("未选择自动检测类别，将仅处理手动区域。")
 
     manual_rois: Optional[Sequence[Tuple[int, int, int, int]]] = None
     if args.manual_roi:
@@ -174,6 +192,8 @@ def main() -> None:
             target_classes=target_classes,
             manual_rois=manual_rois,
             status_callback=status_callback,
+            style=args.style,
+            enable_detection=not args.disable_detector and (target_classes is None or len(target_classes) > 0),
         )
     except Exception as exc:  # pragma: no cover - integration error path
         if json_mode:

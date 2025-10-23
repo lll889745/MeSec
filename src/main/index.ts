@@ -31,6 +31,8 @@ type AnonymizeStartOptions = {
   modelPath?: string;
   aesKey?: string;
   hmacKey?: string;
+  style?: string;
+  disableDetection?: boolean;
 };
 
 type RestoreStartOptions = {
@@ -228,6 +230,14 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
 
   if (options.hmacKey) {
     args.push('--hmac-key', options.hmacKey);
+  }
+
+  if (options.style) {
+    args.push('--style', options.style);
+  }
+
+  if (options.disableDetection) {
+    args.push('--disable-detector');
   }
 
   const pythonEnv = {
