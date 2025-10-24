@@ -2,7 +2,7 @@
 
 fastapi==0.110.1
 uvicorn[standard]==0.29.0
-torch @ file:///C:/Users/5555/Desktop/MeSec/torch-2.2.2+cu118-cp312-cp312-win_amd64.whl
+torch==2.2.2+cu118
 torchvision==0.17.2+cu118
 opencv-contrib-python==4.10.0.84
 cryptography==42.0.7
