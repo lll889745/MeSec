@@ -13,6 +13,8 @@ export type AnonymizeStartOptions = {
   hmacKey?: string;
   style?: string;
   disableDetection?: boolean;
+  embedPack?: boolean;
+  embeddedOutputPath?: string;
 };
 
 export type AnonymizeEventPayload = {
@@ -25,15 +27,17 @@ type AnonymizeStartResult = {
   jobId: string;
   outputPath: string;
   dataPackPath: string;
+  embeddedOutputPath?: string;
 };
 
 export type RestoreStartOptions = {
   anonymizedPath: string;
-  dataPackPath: string;
+  dataPackPath?: string;
   outputPath?: string;
   aesKey: string;
   hmacKey?: string;
   pythonPath?: string;
+  useEmbeddedPack?: boolean;
 };
 
 type RestoreStartResult = {

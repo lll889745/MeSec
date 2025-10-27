@@ -107,6 +107,8 @@ class AnonymizeService:
                 style=payload.get("style", "blur"),
                 disable_detector=bool(payload.get("disableDetection", False)),
                 worker_count=max(1, int(payload.get("workerCount", 1))),
+                embed_pack=bool(payload.get("embedPack", False)),
+                embedded_output_path=Path(payload["embeddedOutputPath"]) if payload.get("embeddedOutputPath") else None,
             )
         except Exception as exc:
             _emit_event(job_id, "error", {"message": str(exc)})
@@ -133,8 +135,15 @@ class AnonymizeService:
                         "input": str(request.input_path),
                         "output": str(request.output_path),
                         "data_pack": str(request.data_pack_path),
+                        "embed_pack": request.embed_pack,
                     },
                 )
+                if request.embedded_output_path is not None:
+                    _emit_event(
+                        job_id,
+                        "embedded_output_resolved",
+                        {"path": str(request.embedded_output_path)},
+                    )
                 result = run_anonymization(
                     model,
                     request,
@@ -145,17 +154,17 @@ class AnonymizeService:
                 digest_bytes = result["digest"]
                 aes_key = result["aes_key"]
                 hmac_key = result["hmac_key"]
-                _emit_event(
-                    job_id,
-                    "completed",
-                    {
-                        "output": result["output"],
-                        "data_pack": result["data_pack"],
-                        "digest": digest_bytes.hex(),
-                        "aes_key": aes_key.hex(),
-                        "hmac_key": hmac_key.hex(),
-                    },
-                )
+                embedded_output = result.get("embedded_output")
+                completed_payload = {
+                    "output": result["output"],
+                    "data_pack": result["data_pack"],
+                    "digest": digest_bytes.hex(),
+                    "aes_key": aes_key.hex(),
+                    "hmac_key": hmac_key.hex(),
+                }
+                if embedded_output:
+                    completed_payload["embedded_output"] = embedded_output
+                _emit_event(job_id, "completed", completed_payload)
             except CancelledError:
                 exit_code = 0
                 _emit_event(job_id, "cancelled")

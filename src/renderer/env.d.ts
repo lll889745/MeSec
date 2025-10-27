@@ -15,20 +15,28 @@ declare global {
 				modelPath?: string;
 				aesKey?: string;
 				hmacKey?: string;
-					style?: string;
-					disableDetection?: boolean;
-			}) => Promise<{ jobId: string; outputPath: string; dataPackPath: string }>;
+				style?: string;
+				disableDetection?: boolean;
+				embedPack?: boolean;
+				embeddedOutputPath?: string;
+			}) => Promise<{
+				jobId: string;
+				outputPath: string;
+				dataPackPath: string;
+				embeddedOutputPath?: string;
+			}>;
 			cancelAnonymize: (jobId: string) => Promise<boolean>;
 			onAnonymizeEvent: (
 				callback: (payload: { jobId: string; event: string; [key: string]: unknown }) => void
 			) => () => void;
 			startRestore: (options: {
 				anonymizedPath: string;
-				dataPackPath: string;
+				dataPackPath?: string;
 				outputPath?: string;
 				aesKey: string;
 				hmacKey?: string;
 				pythonPath?: string;
+				useEmbeddedPack?: boolean;
 			}) => Promise<{ jobId: string; outputPath: string }>;
 			cancelRestore: (jobId: string) => Promise<boolean>;
 			onRestoreEvent: (

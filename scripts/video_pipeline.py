@@ -16,6 +16,7 @@ import numpy as np
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from scripts.data_pack import DataPackWriter
+from scripts.mp4_packager import embed_pack_into_mp4
 
 
 FrameItem = Tuple[int, np.ndarray]
@@ -380,6 +381,8 @@ def run_pipeline(
     enable_detection: bool = True,
     worker_count: int = 1,
     cancel_event: Optional[threading.Event] = None,
+    embed_pack: bool = False,
+    embedded_output_path: Optional[str] = None,
 ) -> bytes:
     frame_queue: Queue = Queue(maxsize=32)
     processed_queue: Queue = Queue(maxsize=32)
@@ -478,6 +481,26 @@ def run_pipeline(
         data_pack_writer.close()
 
     _safe_callback(status_callback, "finalized", {"digest": digest.hex()})
+
+    if embed_pack:
+        embed_target: Optional[Path]
+        if embedded_output_path:
+            embed_target = Path(embedded_output_path)
+        else:
+            embed_target = None
+        packaged_video = embed_pack_into_mp4(
+            output_path_obj,
+            data_pack_path_obj,
+            output_path=embed_target,
+        )
+        _safe_callback(
+            status_callback,
+            "pack_embedded",
+            {
+                "video_path": str(packaged_video),
+                "pack_path": str(data_pack_path_obj),
+            },
+        )
 
     if cancel_event and cancel_event.is_set():
         raise CancelledError()

@@ -44,6 +44,14 @@
             </option>
           </select>
         </div>
+        <div class="control-block">
+          <h3>输出封装</h3>
+          <label class="toggle">
+            <input type="checkbox" v-model="embedPackEnabled" />
+            <span>将加密数据嵌入匿名视频</span>
+          </label>
+          <p class="hint">仍会生成独立的 .pack 备份文件。</p>
+        </div>
       </div>
     </section>
     <section class="actions">
@@ -60,6 +68,17 @@
         <div v-if="latestOutput.dataPack">
           <dt>加密数据包</dt>
           <dd>{{ latestOutput.dataPack }}</dd>
+        </div>
+        <div v-if="latestOutput.embeddedOutput">
+          <dt>嵌入数据</dt>
+          <dd>
+            <template v-if="latestOutput.embeddedOutput === latestOutput.output">
+              已嵌入匿名视频文件
+            </template>
+            <template v-else>
+              {{ latestOutput.embeddedOutput }}
+            </template>
+          </dd>
         </div>
         <div v-if="latestOutput.digest">
           <dt>数据包哈希</dt>
@@ -87,7 +106,7 @@
         >
           使用上述文件恢复原视频
         </button>
-        <p v-if="!canRestoreFromLatest" class="hint">需要匿名视频、数据包和 AES 密钥才能发起恢复。</p>
+        <p v-if="!canRestoreFromLatest" class="hint">需要匿名视频、密钥，以及嵌入或独立的数据包才能发起恢复。</p>
       </div>
     </section>
   </main>
@@ -114,6 +133,8 @@ type LatestOutput = {
   aesKey?: string;
   hmacKey?: string;
   restored?: string;
+  embeddedOutput?: string;
+  embedPack?: boolean;
 };
 
 const statusMessage = ref('等待视频输入');
@@ -143,6 +164,7 @@ const obfuscationStyles = [
   { value: 'mosaic', label: '马赛克' }
 ];
 const selectedStyle = ref(obfuscationStyles[0].value);
+const embedPackEnabled = ref(true);
 
 const progressValue = computed(() => {
   if (!isProcessing.value) {
@@ -158,13 +180,21 @@ const progressValue = computed(() => {
 });
 
 const canRestoreFromLatest = computed(() => {
-  const { output, dataPack, aesKey } = latestOutput.value;
-  return Boolean(output && dataPack && aesKey);
+  const { output, dataPack, embeddedOutput, aesKey } = latestOutput.value;
+  return Boolean(output && aesKey && (dataPack || embeddedOutput));
 });
 
 const hasLatestOutput = computed(() => {
   const value = latestOutput.value;
-  return Boolean(value.output || value.dataPack || value.digest || value.aesKey || value.hmacKey || value.restored);
+  return Boolean(
+    value.output ||
+      value.dataPack ||
+      value.embeddedOutput ||
+      value.digest ||
+      value.aesKey ||
+      value.hmacKey ||
+      value.restored
+  );
 });
 
 function handleProcess(file: File) {
@@ -211,14 +241,18 @@ async function handleDialogConfirm(payload: { manualRois: Array<[number, number,
       classes: disableDetection ? undefined : effectiveClasses,
       manualRois: payload.manualRois.length ? payload.manualRois : undefined,
       disableDetection,
-      style: selectedStyle.value
+      style: selectedStyle.value,
+      embedPack: embedPackEnabled.value
     });
     selectedFile.value = null;
     activeJobId.value = response.jobId;
     statusMessage.value = '匿名任务已启动';
+    const embedEnabled = embedPackEnabled.value;
     latestOutput.value = {
       output: response.outputPath,
-      dataPack: response.dataPackPath
+      dataPack: response.dataPackPath,
+      embedPack: embedEnabled,
+      embeddedOutput: embedEnabled ? response.embeddedOutputPath ?? response.outputPath : undefined
     };
   } catch (error) {
     console.error('Failed to start anonymization', error);
@@ -275,6 +309,29 @@ function handleAnonymizeEvent(payload: JobEventPayload): void {
     case 'detection':
     case 'manual_roi':
       break;
+    case 'embedded_output_resolved': {
+      const resolvedPath = typeof payload.path === 'string' ? (payload.path as string) : undefined;
+      if (resolvedPath) {
+        latestOutput.value = {
+          ...latestOutput.value,
+          embeddedOutput: resolvedPath,
+          embedPack: true
+        };
+      }
+      break;
+    }
+    case 'pack_embedded': {
+      const videoPath = typeof payload.video_path === 'string' ? (payload.video_path as string) : undefined;
+      const packPath = typeof payload.pack_path === 'string' ? (payload.pack_path as string) : undefined;
+      latestOutput.value = {
+        ...latestOutput.value,
+        embeddedOutput: videoPath ?? latestOutput.value.embeddedOutput ?? latestOutput.value.output,
+        dataPack: packPath ?? latestOutput.value.dataPack,
+        embedPack: true
+      };
+      statusMessage.value = videoPath ? `已将加密数据嵌入视频：${videoPath}` : '已将加密数据嵌入视频';
+      break;
+    }
     case 'finalizing': {
       statusMessage.value = '匿名任务收尾中';
       break;
@@ -295,11 +352,29 @@ function handleAnonymizeEvent(payload: JobEventPayload): void {
       const digest = payload.digest as string | undefined;
       const aesKey = payload.aes_key as string | undefined;
       const hmacKey = payload.hmac_key as string | undefined;
+      const embeddedOutput =
+        typeof payload.embedded_output === 'string' && (payload.embedded_output as string).length > 0
+          ? (payload.embedded_output as string)
+          : undefined;
       if (totalFrames.value) {
         processedFrames.value = totalFrames.value;
       }
-      latestOutput.value = { output, dataPack, digest, aesKey, hmacKey };
-      statusMessage.value = output ? `匿名任务完成，输出文件位于 ${output}` : '匿名任务完成';
+      latestOutput.value = {
+        ...latestOutput.value,
+        output,
+        dataPack,
+        digest,
+        aesKey,
+        hmacKey,
+        embeddedOutput: embeddedOutput ?? latestOutput.value.embeddedOutput,
+        embedPack: embeddedOutput ? true : latestOutput.value.embedPack
+      };
+      if (output) {
+        const messageTarget = embeddedOutput ?? output;
+        statusMessage.value = `匿名任务完成，输出文件位于 ${messageTarget}`;
+      } else {
+        statusMessage.value = '匿名任务完成';
+      }
       activeJobId.value = null;
       activeJobType.value = null;
       break;
@@ -429,8 +504,8 @@ async function triggerRestore(): Promise<void> {
     statusMessage.value = '已有任务在执行，请等待完成或取消';
     return;
   }
-  const { output, dataPack, aesKey, hmacKey } = latestOutput.value;
-  if (!output || !dataPack || !aesKey) {
+  const { output, dataPack, aesKey, hmacKey, embeddedOutput } = latestOutput.value;
+  if (!output || !aesKey || (!dataPack && !embeddedOutput)) {
     statusMessage.value = '缺少恢复所需的信息';
     return;
   }
@@ -442,12 +517,19 @@ async function triggerRestore(): Promise<void> {
   activeJobType.value = 'restore';
 
   try {
-    const response = await window.electronAPI.startRestore({
+    const useEmbeddedPack = Boolean(embeddedOutput);
+    const restoreOptions: Parameters<typeof window.electronAPI.startRestore>[0] = {
       anonymizedPath: output,
-      dataPackPath: dataPack,
       aesKey,
-      hmacKey: hmacKey || undefined
-    });
+      hmacKey: hmacKey || undefined,
+      useEmbeddedPack
+    };
+    if (!useEmbeddedPack) {
+      restoreOptions.dataPackPath = dataPack as string;
+    } else if (dataPack) {
+      restoreOptions.dataPackPath = dataPack;
+    }
+    const response = await window.electronAPI.startRestore(restoreOptions);
     activeJobId.value = response.jobId;
     latestOutput.value = { ...latestOutput.value, restored: response.outputPath };
     statusMessage.value = '恢复任务已启动';

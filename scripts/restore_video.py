@@ -1,6 +1,8 @@
 import argparse
 import json
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,6 +17,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from scripts.data_pack import DataPackReader
+from scripts.mp4_packager import DEFAULT_PACK_UUID, extract_pack_from_mp4
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-pack",
         type=Path,
-        required=True,
-        help="Path to the encrypted ROI data pack",
+        default=None,
+        help="Path to the encrypted ROI data pack (omit to load from the anonymized video)",
     )
     parser.add_argument(
         "--output",
@@ -48,6 +51,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Hex-encoded HMAC key used for pack integrity (defaults to AES key)",
+    )
+    parser.add_argument(
+        "--embedded",
+        action="store_true",
+        help="Load the encrypted ROI data from a custom UUID box inside the anonymized MP4",
+    )
+    parser.add_argument(
+        "--pack-uuid",
+        type=str,
+        default="1f0cf7d5-1c3c-4e25-ba9d-5cb0fc61f847",
+        help="UUID identifying the embedded ROI data box (default matches the anonymizer).",
     )
     parser.add_argument(
         "--json-progress",
@@ -121,11 +135,39 @@ def main() -> None:
         else:
             print(message)
 
+    temp_pack_path: Optional[Path] = None
+    data_pack_reference: Optional[str] = None
+
     try:
         key = decode_key(args.key)
         hmac_key = decode_key(args.hmac_key) if args.hmac_key else key
 
-        frame_map, pack_fps, pack_size = load_data_pack(args.data_pack, hmac_key)
+        pack_uuid_str = args.pack_uuid or str(DEFAULT_PACK_UUID)
+        try:
+            pack_uuid = uuid.UUID(pack_uuid_str)
+        except ValueError as exc:
+            raise ValueError("pack-uuid 参数不是有效的 UUID 字符串") from exc
+
+        if args.data_pack is None and not args.embedded:
+            raise ValueError("必须提供 --data-pack 或启用 --embedded 选项。")
+
+        if args.embedded:
+            payload = extract_pack_from_mp4(args.anonymized_video, box_uuid=pack_uuid)
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pack")
+            try:
+                tmp_file.write(payload)
+            finally:
+                tmp_file.close()
+            temp_pack_path = Path(tmp_file.name)
+            data_pack_path = temp_pack_path
+            log("已从视频中提取嵌入的 ROI 数据。")
+            data_pack_reference = f"embedded:{pack_uuid}"  # 记录来源，便于后续日志
+        else:
+            assert args.data_pack is not None
+            data_pack_path = args.data_pack
+            data_pack_reference = str(data_pack_path)
+
+        frame_map, pack_fps, pack_size = load_data_pack(data_pack_path, hmac_key)
 
         cap = cv2.VideoCapture(str(args.anonymized_video))
         if not cap.isOpened():
@@ -232,6 +274,9 @@ def main() -> None:
         if json_mode:
             emit_event("error", {"message": str(exc)})
         raise
+    finally:
+        if temp_pack_path and temp_pack_path.exists():
+            temp_pack_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

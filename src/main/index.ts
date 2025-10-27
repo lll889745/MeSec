@@ -34,15 +34,18 @@ type AnonymizeStartOptions = {
   style?: string;
   disableDetection?: boolean;
   workerCount?: number;
+  embedPack?: boolean;
+  embeddedOutputPath?: string;
 };
 
 type RestoreStartOptions = {
   anonymizedPath: string;
-  dataPackPath: string;
+  dataPackPath?: string;
   outputPath?: string;
   aesKey: string;
   hmacKey?: string;
   pythonPath?: string;
+  useEmbeddedPack?: boolean;
 };
 
 type RunningJob = {
@@ -327,6 +330,12 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
   ensureParentDir(outputPath);
   ensureParentDir(dataPackPath);
 
+  const embedPack = options.embedPack !== false;
+  const embeddedOutputPath = options.embeddedOutputPath;
+  if (embeddedOutputPath) {
+    ensureParentDir(embeddedOutputPath);
+  }
+
   const pythonEnv = {
     ...process.env,
     PYTHONIOENCODING: 'utf-8'
@@ -354,8 +363,13 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
     dataPackPath,
     device: options.device ?? 'auto',
     workerCount,
-    disableDetection: Boolean(options.disableDetection)
+    disableDetection: Boolean(options.disableDetection),
+    embedPack,
   };
+
+  if (embeddedOutputPath) {
+    payload.embeddedOutputPath = embeddedOutputPath;
+  }
 
   if (options.modelPath) {
     payload.modelPath = options.modelPath;
@@ -389,7 +403,8 @@ ipcMain.handle('anonymize:start', async (event, options: AnonymizeStartOptions) 
   return {
     jobId,
     outputPath,
-    dataPackPath
+    dataPackPath,
+    embeddedOutputPath: embedPack ? embeddedOutputPath ?? outputPath : undefined
   };
 });
 
@@ -423,8 +438,14 @@ ipcMain.handle('anonymize:cancel', async (_event, jobId: string) => {
 });
 
 ipcMain.handle('restore:start', async (event, options: RestoreStartOptions) => {
-  if (!options || !options.anonymizedPath || !options.dataPackPath || !options.aesKey) {
+  if (!options || !options.anonymizedPath || !options.aesKey) {
     throw new Error('缺少恢复所需的参数');
+  }
+
+  const useEmbeddedPack = Boolean(options.useEmbeddedPack);
+
+  if (!useEmbeddedPack && !options.dataPackPath) {
+    throw new Error('缺少数据包路径');
   }
 
   const anonymizedPath = options.anonymizedPath;
@@ -432,7 +453,7 @@ ipcMain.handle('restore:start', async (event, options: RestoreStartOptions) => {
   if (!existsSync(anonymizedPath)) {
     throw new Error(`匿名视频不存在: ${anonymizedPath}`);
   }
-  if (!existsSync(dataPackPath)) {
+  if (!useEmbeddedPack && dataPackPath && !existsSync(dataPackPath)) {
     throw new Error(`数据包不存在: ${dataPackPath}`);
   }
 
@@ -449,14 +470,21 @@ ipcMain.handle('restore:start', async (event, options: RestoreStartOptions) => {
     scriptPath,
     '--anonymized-video',
     anonymizedPath,
-    '--data-pack',
-    dataPackPath,
     '--output',
     outputPath,
     '--key',
     options.aesKey,
     '--json-progress'
   ];
+
+  if (useEmbeddedPack) {
+    args.push('--embedded');
+    if (dataPackPath && existsSync(dataPackPath)) {
+      args.push('--data-pack', dataPackPath);
+    }
+  } else if (dataPackPath) {
+    args.push('--data-pack', dataPackPath);
+  }
 
   if (options.hmacKey) {
     args.push('--hmac-key', options.hmacKey);
@@ -484,7 +512,8 @@ ipcMain.handle('restore:start', async (event, options: RestoreStartOptions) => {
     event: 'started',
     anonymized: anonymizedPath,
     data_pack: dataPackPath,
-    output: outputPath
+    output: outputPath,
+    embedded: useEmbeddedPack
   });
 
   let stdoutBuffer = '';

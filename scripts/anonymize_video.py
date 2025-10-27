@@ -28,6 +28,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output encrypted metadata pack path (default: alongside output video)",
     )
+    parser.add_argument(
+        "--embed-pack",
+        action="store_true",
+        help="Embed the generated .pack into the anonymized MP4 as a custom UUID box.",
+    )
+    parser.add_argument(
+        "--embedded-output",
+        type=Path,
+        default=None,
+        help="Optional output path for the MP4 with embedded ROI data (defaults to modifying the output file).",
+    )
     parser.add_argument("--model", type=Path, default=Path("yolov8n.pt"), help="YOLOv8 weights path or name")
     parser.add_argument(
         "--device",
@@ -135,6 +146,8 @@ class AnonymizationRequest:
     style: str = "blur"
     disable_detector: bool = False
     worker_count: int = 1
+    embed_pack: bool = False
+    embedded_output_path: Optional[Path] = None
 
 
 def parse_manual_roi_args(values: Optional[Sequence[str]]) -> Optional[List[Tuple[int, int, int, int]]]:
@@ -206,15 +219,26 @@ def run_anonymization(
         enable_detection=not request.disable_detector and (target_classes is None or len(target_classes) > 0),
         worker_count=max(1, request.worker_count),
         cancel_event=cancel_event,
+        embed_pack=request.embed_pack,
+        embedded_output_path=str(request.embedded_output_path) if request.embedded_output_path else None,
     )
 
-    return {
+    embedded_video_path: Optional[Path] = None
+    if request.embed_pack:
+        embedded_video_path = request.embedded_output_path or request.output_path
+
+    result: Dict[str, object] = {
         "output": str(request.output_path),
         "data_pack": str(request.data_pack_path),
         "digest": digest,
         "aes_key": encryption_key,
         "hmac_key": hmac_key,
     }
+
+    if embedded_video_path is not None:
+        result["embedded_output"] = str(embedded_video_path)
+
+    return result
 
 
 def main() -> None:
@@ -255,6 +279,8 @@ def main() -> None:
         style=args.style,
         disable_detector=args.disable_detector,
         worker_count=max(1, args.workers),
+        embed_pack=bool(args.embed_pack),
+        embedded_output_path=args.embedded_output,
     )
 
     log(f"加载模型 {args.model} 到 {resolve_device(args.device)} 设备")
@@ -287,6 +313,7 @@ def main() -> None:
     digest_bytes = result["digest"]
     aes_key = result["aes_key"]
     hmac_key = result["hmac_key"]
+    embedded_output = result.get("embedded_output")
 
     if json_mode:
         emit_event(
@@ -297,6 +324,7 @@ def main() -> None:
                 "digest": digest_bytes.hex(),
                 "aes_key": aes_key.hex(),
                 "hmac_key": hmac_key.hex(),
+                "embedded_output": embedded_output,
             },
         )
     else:
@@ -305,6 +333,8 @@ def main() -> None:
         print(f"数据包 HMAC: {digest_bytes.hex()}")
         print(f"AES 密钥 (hex): {aes_key.hex()}")
         print(f"HMAC 密钥 (hex): {hmac_key.hex()}")
+        if embedded_output:
+            print(f"嵌入数据的视频: {embedded_output}")
 
 
 if __name__ == "__main__":
