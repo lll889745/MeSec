@@ -1,10 +1,3 @@
-## 前置要求
-
-- Node.js 18+
-- npm 9+
-- Python 3.9+
-- NVIDIA GPU, CUDA Toolkit & cuDNN
-
 ##  快速开始
 
 **1. 安装依赖**
