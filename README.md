@@ -19,7 +19,5 @@ npm run dev
 
 ```powershell
 npm run build
-
-# 可选
 npm run build:win
 ```
