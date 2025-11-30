@@ -29,7 +29,7 @@
                 v-model="selectedClassIds"
                 :disabled="!detectionEnabled"
               />
-              <span>{{ item.label }} <small>({{ item.id }})</small></span>
+              <span>{{ item.label }}</span>
             </label>
           </div>
           <p class="hint" v-if="detectionEnabled && !selectedClassIds.length">
@@ -37,7 +37,7 @@
           </p>
         </div>
         <div class="control-block">
-          <h3>匿名化风格</h3>
+          <h3>风格</h3>
           <select v-model="selectedStyle">
             <option v-for="style in obfuscationStyles" :key="style.value" :value="style.value">
               {{ style.label }}
@@ -50,7 +50,6 @@
             <input type="checkbox" v-model="embedPackEnabled" />
             <span>将加密数据嵌入匿名视频</span>
           </label>
-          <p class="hint">仍会生成独立的 .pack 备份文件。</p>
         </div>
       </div>
     </section>
